@@ -1,6 +1,7 @@
 fastapi==0.111.0
 uvicorn==0.29.0
 scikit-learn==1.4.2
+xgboost==2.0.3
 pandas==2.2.2
 numpy==1.26.4
 apscheduler==3.10.4

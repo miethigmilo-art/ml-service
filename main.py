@@ -13,6 +13,7 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+from xgboost import XGBClassifier
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ── Setup ─────────────────────────────────────────────
@@ -27,8 +28,8 @@ MODELS_DIR = Path(os.getenv("MODELS_DIR", "./models"))
 DATA_DIR.mkdir(exist_ok=True)
 MODELS_DIR.mkdir(exist_ok=True)
 
-MIN_TRADES   = int(os.getenv("MIN_TRADES", "30"))   # Mindest-Trades für Training
-PREDICT_CONF = float(os.getenv("PREDICT_CONF", "0.58"))  # Mindest-Konfidenz für Trade
+MIN_TRADES   = int(os.getenv("MIN_TRADES", "60"))    # Mindest-Trades für Training (erhöht für bessere Statistik)
+PREDICT_CONF = float(os.getenv("PREDICT_CONF", "0.62"))  # Mindest-Konfidenz für vollen Trade (erhöht)
 
 STRATEGIEN = ["mittel", "aggressiv", "smart", "konservativ", "optimiert", "test", "adaptive", "steady"]
 
@@ -96,18 +97,26 @@ def baue_features(trades: list) -> tuple:
             else:
                 break
 
+        hour = t.get("hour", 12)
         row = {
-            "hour":        t.get("hour", 12),
-            "weekday":     t.get("weekday", 0),
-            "side_buy":    1 if t.get("side", "BUY") == "BUY" else 0,
-            "wr5":         round(wr5, 3),
-            "wr15":        round(wr15, 3),
-            "konsek":      min(konsek, 10),
-            "equity":      t.get("equity", 1000),
-            "rrr":         t.get("rrr") or 2.0,
-            "recentWR5":   t.get("recentWR5") or round(wr5 * 100, 1),
-            "recentWR15":  t.get("recentWR15") or round(wr15 * 100, 1),
-            "label":       1 if pnl > 0 else 0,
+            # Zeitbasierte Features
+            "hour":           hour,
+            "weekday":        t.get("weekday", 0),
+            "sessionLondon":  t.get("sessionLondon",  1 if 8  <= hour < 12 else 0),
+            "sessionOverlap": t.get("sessionOverlap", 1 if 13 <= hour < 17 else 0),
+            # Trade-Richtung
+            "side_buy":       1 if t.get("side", "BUY") == "BUY" else 0,
+            # Performance-Context
+            "wr5":            round(wr5, 3),
+            "wr15":           round(wr15, 3),
+            "konsek":         min(konsek, 10),
+            # Markt-Struktur (neu — aus Fix 3 in server.js)
+            "rrr":            t.get("rrr") or 2.0,
+            "slDistPct":      t.get("slDistPct") or 0.5,    # SL-Abstand in % vom Entry
+            "rewardPct":      t.get("rewardPct") or 1.0,    # TP-Abstand in % vom Entry
+            "spread":         t.get("spread") or 0.0,        # Bid-Ask Spread
+            "drawdownPct":    t.get("drawdownPct") or 0.0,  # Drawdown vom Start-Equity
+            "label":          1 if pnl > 0 else 0,
         }
         rows.append(row)
 
@@ -131,16 +140,25 @@ def trainiere(strategie: str) -> dict:
     if X is None or len(X) < MIN_TRADES:
         return {"status": "feature_fehler", "n_trades": len(trades)}
 
-    # Pipeline: Skalierung + Random Forest
+    # Klassen-Balance für XGBoost berechnen (kompensiert ungleiche Win/Loss-Verteilung)
+    neg = int(np.sum(y == 0))
+    pos = int(np.sum(y == 1))
+    scale_pos = round(neg / pos, 3) if pos > 0 else 1.0
+
+    # Pipeline: Skalierung + XGBoost (bessere Performance bei kleinen Datensätzen als Random Forest)
     pipeline = Pipeline([
         ("scaler", StandardScaler()),
-        ("model",  RandomForestClassifier(
-            n_estimators=200,
-            max_depth=6,
-            min_samples_leaf=3,
-            class_weight="balanced",
+        ("model",  XGBClassifier(
+            n_estimators=300,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            scale_pos_weight=scale_pos,
+            eval_metric="logloss",
             random_state=42,
             n_jobs=-1,
+            verbosity=0,
         ))
     ])
 
@@ -289,19 +307,39 @@ def predict(req: PredictRequest):
     win_prob = float(proba[1]) if len(proba) > 1 else float(proba[0])
     konfidenz = round(win_prob, 3)
 
-    empfehlung = "trade" if win_prob >= PREDICT_CONF else "skip"
-    grund = (
-        f"ML: {win_prob:.0%} Gewinn-Wahrscheinlichkeit (Schwelle: {PREDICT_CONF:.0%})"
-    )
+    # Konfidenz-basiertes Sizing statt binärem trade/skip
+    # Hohes Vertrauen → volle oder erhöhte Größe; mittleres → halbe Größe; niedrig → skip
+    SCHWELLE_REDUZIERT = 0.54  # unter PREDICT_CONF aber über dieser → halbe Größe
+    SCHWELLE_GROSS     = 0.72  # sehr hohe Konfidenz → 1.5x Größe (gedeckelt durch maxRiskPct)
 
-    log.info(f"[{req.strategie}] Predict: {req.side} → {empfehlung} ({win_prob:.0%})")
+    if win_prob >= SCHWELLE_GROSS:
+        empfehlung   = "trade"
+        sizing_faktor = 1.5
+        sizing_grund  = f"Sehr hohe Konfidenz ({win_prob:.0%}) → 1.5× Größe"
+    elif win_prob >= PREDICT_CONF:
+        empfehlung   = "trade"
+        sizing_faktor = 1.0
+        sizing_grund  = f"Konfidenz OK ({win_prob:.0%} ≥ {PREDICT_CONF:.0%})"
+    elif win_prob >= SCHWELLE_REDUZIERT:
+        empfehlung   = "reduziert"
+        sizing_faktor = 0.5
+        sizing_grund  = f"Mittlere Konfidenz ({win_prob:.0%}) → halbe Größe"
+    else:
+        empfehlung   = "skip"
+        sizing_faktor = 0.0
+        sizing_grund  = f"Zu niedrige Konfidenz ({win_prob:.0%} < {SCHWELLE_REDUZIERT:.0%})"
+
+    grund = f"ML: {win_prob:.0%} Gewinn-Wahrscheinlichkeit — {sizing_grund}"
+
+    log.info(f"[{req.strategie}] Predict: {req.side} → {empfehlung} ({win_prob:.0%}, sizing={sizing_faktor}×)")
     return {
-        "empfehlung": empfehlung,
-        "konfidenz":  konfidenz,
-        "win_prob":   round(win_prob * 100, 1),
-        "schwelle":   round(PREDICT_CONF * 100, 1),
-        "grund":      grund,
-        "trainiert":  True,
+        "empfehlung":   empfehlung,
+        "konfidenz":    konfidenz,
+        "win_prob":     round(win_prob * 100, 1),
+        "schwelle":     round(PREDICT_CONF * 100, 1),
+        "sizing_faktor": sizing_faktor,
+        "grund":        grund,
+        "trainiert":    True,
     }
 
 @app.get("/feature-importance/{strategie}")
@@ -309,8 +347,9 @@ def feature_importance(strategie: str):
     if strategie not in models:
         raise HTTPException(404, "Kein Modell für diese Strategie")
     rf = models[strategie].named_steps["model"]
-    names = ["hour","weekday","side_buy","wr5","wr15","konsek","equity","rrr","recentWR5","recentWR15"]
-    importance = sorted(zip(names, rf.feature_importances_), key=lambda x: -x[1])
+    names = ["hour","weekday","sessionLondon","sessionOverlap","side_buy","wr5","wr15","konsek","rrr","slDistPct","rewardPct","spread","drawdownPct"]
+    importances = rf.feature_importances_ if hasattr(rf, "feature_importances_") else []
+    importance = sorted(zip(names[:len(importances)], importances), key=lambda x: -x[1])
     return {"strategie": strategie, "importance": [{"feature": n, "wert": round(float(v),4)} for n,v in importance]}
 
 # ── TradingView CSV Import ────────────────────────────

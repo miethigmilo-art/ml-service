@@ -228,6 +228,7 @@ class PredictRequest(BaseModel):
     recentWR15: Optional[float] = None
     konsek: Optional[int] = None
     rrr: Optional[float] = 2.0
+    threshold: Optional[float] = None  # Dynamischer Schwellwert vom master-bot (Market Mode)
 
 # ── API Endpoints ─────────────────────────────────────
 @app.get("/health")
@@ -307,39 +308,43 @@ def predict(req: PredictRequest):
     win_prob = float(proba[1]) if len(proba) > 1 else float(proba[0])
     konfidenz = round(win_prob, 3)
 
+    # Dynamischer Schwellwert: vom master-bot übergeben (Market Mode) oder Fallback auf PREDICT_CONF
+    dyn_threshold    = float(req.threshold) if req.threshold is not None else PREDICT_CONF
+    dyn_threshold    = max(0.50, min(0.95, dyn_threshold))  # Sicherheitsgrenzen
+
     # Konfidenz-basiertes Sizing statt binärem trade/skip
     # Hohes Vertrauen → volle oder erhöhte Größe; mittleres → halbe Größe; niedrig → skip
-    SCHWELLE_REDUZIERT = 0.54  # unter PREDICT_CONF aber über dieser → halbe Größe
-    SCHWELLE_GROSS     = 0.72  # sehr hohe Konfidenz → 1.5x Größe (gedeckelt durch maxRiskPct)
+    SCHWELLE_REDUZIERT = 0.54   # unter Threshold aber über dieser → halbe Größe
+    SCHWELLE_GROSS     = 0.72   # sehr hohe Konfidenz → 1.5x Größe
 
     if win_prob >= SCHWELLE_GROSS:
-        empfehlung   = "trade"
+        empfehlung    = "trade"
         sizing_faktor = 1.5
         sizing_grund  = f"Sehr hohe Konfidenz ({win_prob:.0%}) → 1.5× Größe"
-    elif win_prob >= PREDICT_CONF:
-        empfehlung   = "trade"
+    elif win_prob >= dyn_threshold:
+        empfehlung    = "trade"
         sizing_faktor = 1.0
-        sizing_grund  = f"Konfidenz OK ({win_prob:.0%} ≥ {PREDICT_CONF:.0%})"
+        sizing_grund  = f"Konfidenz OK ({win_prob:.0%} ≥ {dyn_threshold:.0%})"
     elif win_prob >= SCHWELLE_REDUZIERT:
-        empfehlung   = "reduziert"
+        empfehlung    = "reduziert"
         sizing_faktor = 0.5
         sizing_grund  = f"Mittlere Konfidenz ({win_prob:.0%}) → halbe Größe"
     else:
-        empfehlung   = "skip"
+        empfehlung    = "skip"
         sizing_faktor = 0.0
         sizing_grund  = f"Zu niedrige Konfidenz ({win_prob:.0%} < {SCHWELLE_REDUZIERT:.0%})"
 
     grund = f"ML: {win_prob:.0%} Gewinn-Wahrscheinlichkeit — {sizing_grund}"
 
-    log.info(f"[{req.strategie}] Predict: {req.side} → {empfehlung} ({win_prob:.0%}, sizing={sizing_faktor}×)")
+    log.info(f"[{req.strategie}] Predict: {req.side} → {empfehlung} ({win_prob:.0%}, threshold={dyn_threshold:.0%}, sizing={sizing_faktor}×)")
     return {
-        "empfehlung":   empfehlung,
-        "konfidenz":    konfidenz,
-        "win_prob":     round(win_prob * 100, 1),
-        "schwelle":     round(PREDICT_CONF * 100, 1),
+        "empfehlung":    empfehlung,
+        "konfidenz":     konfidenz,
+        "win_prob":      round(win_prob * 100, 1),
+        "schwelle":      round(dyn_threshold * 100, 1),
         "sizing_faktor": sizing_faktor,
-        "grund":        grund,
-        "trainiert":    True,
+        "grund":         grund,
+        "trainiert":     True,
     }
 
 @app.get("/feature-importance/{strategie}")

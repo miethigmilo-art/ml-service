@@ -320,6 +320,27 @@ def train(req: TrainRequest):
             ergebnisse[s] = {"status": "fehler", "detail": str(e)}
     return ergebnisse
 
+
+# ── /retrain — Alias für AutoRetrain (Phase 7 HELIX) ──────────────────────────
+class RetrainRequest(BaseModel):
+    strategie: Optional[str] = None  # None oder "all" = alle Strategien
+
+@app.post("/retrain")
+def retrain(req: RetrainRequest):
+    """Alias von /train — akzeptiert strategie='all' oder None für alle Strategien."""
+    strat = req.strategie if req.strategie and req.strategie != "all" else None
+    strategien = [strat] if strat else STRATEGIEN
+    ergebnisse = {}
+    for s in strategien:
+        if s not in STRATEGIEN:
+            ergebnisse[s] = {"status": "unbekannte_strategie"}
+            continue
+        try:
+            ergebnisse[s] = trainiere(s)
+        except Exception as e:
+            ergebnisse[s] = {"status": "fehler", "detail": str(e)}
+    return {"ok": True, "strategien": ergebnisse}
+
 @app.post("/predict")
 def predict(req: PredictRequest):
     if req.strategie not in STRATEGIEN:

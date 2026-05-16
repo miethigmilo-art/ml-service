@@ -856,4 +856,63 @@ def import_page():
     <label>CSV-Datei</label>
     <input type="file" name="file" accept=".csv,.txt" required>
     <label style="display:flex;align-items:center;gap:8px;margin-top:14px">
-      <input type=
+      <input type=    <label style="display:flex;align-items:center;gap:8px;margin-top:14px">
+      <input type="checkbox" name="retrain" checked> Direkt nach Import trainieren
+    </label>
+    <button type="submit">📤 Importieren & Trainieren</button>
+  </form>
+  <div class="result" id="r-tv"></div>
+</div>
+
+<script>
+function show(id, el) {{
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById('p-'+id).classList.add('active');
+  el.classList.add('active');
+}}
+
+async function submitForm(formId, endpoint, resultId) {{
+  const form = document.getElementById(formId);
+  const fd = new FormData(form);
+  fd.set('retrain', fd.get('retrain') ? 'true' : 'false');
+  const btn = form.querySelector('button');
+  btn.textContent = '\u23f3 Importiere...'; btn.disabled = true;
+  const el = document.getElementById(resultId);
+  el.style.display = 'block';
+  try {{
+    const r = await fetch(endpoint, {{method:'POST', body: fd}});
+    const d = await r.json();
+    if (r.ok) {{
+      let html = `<span class="ok">\u2705 Erfolg!</span>\\n`;
+      html += `Neue Trades: ${{d.trades_neu}} / ${{d.trades_gesamt}} gesamt\\n`;
+      if (d.pro_strategie) html += `Pro Strategie: ${{JSON.stringify(d.pro_strategie)}}\\n`;
+      if (d.training) {{
+        html += `\\nTraining:\\n`;
+        for (const [s,t] of Object.entries(d.training)) {{
+          html += `  ${{s}}: ${{t.status}} \u2014 Accuracy ${{((t.accuracy_cv||0)*100).toFixed(1)}}% (${{t.n_trades}} Trades)\\n`;
+        }}
+      }}
+      el.innerHTML = html;
+    }} else {{
+      el.innerHTML = `<span class="err">\u274c Fehler: ${{d.detail || JSON.stringify(d)}}</span>`;
+    }}
+  }} catch(err) {{
+    el.innerHTML = `<span class="err">\u274c ${{err.message}}</span>`;
+  }}
+  btn.textContent = '\U0001f4e4 Importieren & Trainieren'; btn.disabled = false;
+}}
+
+document.getElementById('f-tg').onsubmit = e => {{ e.preventDefault(); submitForm('f-tg','/import-telegram','r-tg'); }};
+document.getElementById('f-tv').onsubmit = e => {{ e.preventDefault(); submitForm('f-tv','/import-csv','r-tv'); }};
+</script></body></html>"""
+
+# \u2500\u2500 Startup \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+@app.on_event("startup")
+def startup():
+    lade_gespeicherte_modelle()
+    # W\u00f6chentliches Auto-Retrain (jeden Montag 03:00)
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(retrain_alle, "cron", day_of_week="mon", hour=3)
+    scheduler.start()
+    log.info("ML-Service gestartet")

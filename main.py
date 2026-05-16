@@ -3,6 +3,16 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
+# PostgreSQL (optional — graceful fallback auf JSONL wenn nicht verfügbar)
+DATABASE_URL = os.getenv("DATABASE_URL")
+_pg_available = False
+try:
+    import psycopg2
+    import psycopg2.extras
+    _pg_available = bool(DATABASE_URL)
+except ImportError:
+    pass
+
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
@@ -39,14 +49,57 @@ model_meta: dict = {}    # { strategie: { trainiert_am, accuracy, n_trades } }
 trades_cache: dict = {}  # { strategie: [trades] }
 
 # ── Daten laden ───────────────────────────────────────
+def lade_trades_von_db(strategie: str) -> list:
+    """Lädt Features direkt aus PostgreSQL (geteilt mit master-bot)"""
+    if not _pg_available:
+        return []
+    try:
+        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT ts, strategie, side, equity::float, hour, weekday,
+                   recent_wr5::float    AS "recentWR5",
+                   recent_wr15::float   AS "recentWR15",
+                   konsek,
+                   rrr::float,
+                   ausgefuehrt,
+                   grund,
+                   market_modus         AS "marketModus",
+                   sl_dist_pct::float   AS "slDistPct",
+                   reward_pct::float    AS "rewardPct",
+                   spread::float,
+                   session_london       AS "sessionLondon",
+                   session_overlap      AS "sessionOverlap",
+                   drawdown_pct::float  AS "drawdownPct",
+                   pnl::float
+            FROM features
+            WHERE strategie=%s AND ausgefuehrt=true AND pnl IS NOT NULL
+            ORDER BY ts ASC LIMIT 2000
+        """, (strategie,))
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        if rows:
+            log.info(f"[{strategie}] {len(rows)} Features aus PostgreSQL geladen")
+            return rows
+    except Exception as e:
+        log.warning(f"[{strategie}] DB-Fehler, fallback auf JSONL: {e}")
+    return []
+
+
 def lade_trades(strategie: str) -> list:
-    """Lädt Trades aus features.jsonl (bevorzugt) oder trades.json"""
+    """Lädt Trades — bevorzugt PostgreSQL, Fallback auf features.jsonl / trades.json"""
+
+    # 1. PostgreSQL (Railway shared DB — master-bot schreibt, ml-service liest)
+    db_trades = lade_trades_von_db(strategie)
+    if db_trades:
+        trades_cache[strategie] = db_trades
+        return db_trades
+
+    # 2. Fallback: features.jsonl (lokal / Docker)
     features_file = DATA_DIR / "features.jsonl"
     trades_file   = DATA_DIR / "trades.json"
-
     trades = []
 
-    # 1. Feature-Log (reichhaltigste Daten)
     if features_file.exists():
         with open(features_file) as f:
             for line in f:
@@ -57,18 +110,18 @@ def lade_trades(strategie: str) -> list:
                 except:
                     pass
 
-    # 2. Fallback: trades.json
+    # 3. Letzter Fallback: trades.json
     if not trades and trades_file.exists():
         with open(trades_file) as f:
             all_trades = json.load(f)
         raw = all_trades.get(strategie, [])
         for t in raw:
             trades.append({
-                "pnl":      t.get("pnl", 0),
-                "side":     t.get("side", "BUY"),
-                "equity":   t.get("equity", 1000),
-                "hour":     datetime.fromisoformat(t["datum"]).hour if "datum" in t else 12,
-                "weekday":  datetime.fromisoformat(t["datum"]).weekday() if "datum" in t else 0,
+                "pnl":         t.get("pnl", 0),
+                "side":        t.get("side", "BUY"),
+                "equity":      t.get("equity", 1000),
+                "hour":        datetime.fromisoformat(t["datum"]).hour if "datum" in t else 12,
+                "weekday":     datetime.fromisoformat(t["datum"]).weekday() if "datum" in t else 0,
                 "ausgefuehrt": True,
             })
 
@@ -234,8 +287,9 @@ class PredictRequest(BaseModel):
 @app.get("/health")
 def health():
     return {
-        "status": "ok",
-        "modelle": list(models.keys()),
+        "status":    "ok",
+        "modelle":   list(models.keys()),
+        "db":        "postgresql" if _pg_available else "jsonl-fallback",
         "timestamp": datetime.now().isoformat()
     }
 
@@ -802,62 +856,4 @@ def import_page():
     <label>CSV-Datei</label>
     <input type="file" name="file" accept=".csv,.txt" required>
     <label style="display:flex;align-items:center;gap:8px;margin-top:14px">
-      <input type="checkbox" name="retrain" checked> Direkt nach Import trainieren
-    </label>
-    <button type="submit">📤 Importieren & Trainieren</button>
-  </form>
-  <div class="result" id="r-tv"></div>
-</div>
-
-<script>
-function show(id, el) {{
-  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  document.getElementById('p-'+id).classList.add('active');
-  el.classList.add('active');
-}}
-
-async function submitForm(formId, endpoint, resultId) {{
-  const form = document.getElementById(formId);
-  const fd = new FormData(form);
-  fd.set('retrain', fd.get('retrain') ? 'true' : 'false');
-  const btn = form.querySelector('button');
-  btn.textContent = '⏳ Importiere...'; btn.disabled = true;
-  const el = document.getElementById(resultId);
-  el.style.display = 'block';
-  try {{
-    const r = await fetch(endpoint, {{method:'POST', body: fd}});
-    const d = await r.json();
-    if (r.ok) {{
-      let html = `<span class="ok">✅ Erfolg!</span>\\n`;
-      html += `Neue Trades: ${{d.trades_neu}} / ${{d.trades_gesamt}} gesamt\\n`;
-      if (d.pro_strategie) html += `Pro Strategie: ${{JSON.stringify(d.pro_strategie)}}\\n`;
-      if (d.training) {{
-        html += `\\nTraining:\\n`;
-        for (const [s,t] of Object.entries(d.training)) {{
-          html += `  ${{s}}: ${{t.status}} — Accuracy ${{((t.accuracy_cv||0)*100).toFixed(1)}}% (${{t.n_trades}} Trades)\\n`;
-        }}
-      }}
-      el.innerHTML = html;
-    }} else {{
-      el.innerHTML = `<span class="err">❌ Fehler: ${{d.detail || JSON.stringify(d)}}</span>`;
-    }}
-  }} catch(err) {{
-    el.innerHTML = `<span class="err">❌ ${{err.message}}</span>`;
-  }}
-  btn.textContent = '📤 Importieren & Trainieren'; btn.disabled = false;
-}}
-
-document.getElementById('f-tg').onsubmit = e => {{ e.preventDefault(); submitForm('f-tg','/import-telegram','r-tg'); }};
-document.getElementById('f-tv').onsubmit = e => {{ e.preventDefault(); submitForm('f-tv','/import-csv','r-tv'); }};
-</script></body></html>"""
-
-# ── Startup ───────────────────────────────────────────
-@app.on_event("startup")
-def startup():
-    lade_gespeicherte_modelle()
-    # Wöchentliches Auto-Retrain (jeden Montag 03:00)
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(retrain_alle, "cron", day_of_week="mon", hour=3)
-    scheduler.start()
-    log.info("ML-Service gestartet")
+      <input type=
